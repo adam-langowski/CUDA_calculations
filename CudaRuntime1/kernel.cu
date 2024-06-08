@@ -4,10 +4,11 @@
 #include <fstream>
 #include <chrono>
 #include <cmath>
+#include <tuple>
+#include <string>
 
 // Kernel CUDA do obliczeń
 __global__ void calculateOnGPU(const float* input, float* output, int N, int R) {
-    extern __shared__ float sharedMem[];
     int outSize = N - 2 * R;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -15,7 +16,7 @@ __global__ void calculateOnGPU(const float* input, float* output, int N, int R) 
     if (i < outSize && j < outSize) {
         float sum = 0.0f;
         for (int x = -R; x <= R; ++x) {
-            for (int y = -R; y <= R; ++y) {
+            for (int y = -R; ++y <= R;) {
                 sum += input[(i + R + x) * N + (j + R + y)];
             }
         }
@@ -40,6 +41,16 @@ void loadDataFromFile(std::vector<float>& data, const std::string& filename) {
     inFile.close();
 }
 
+void loadParamsFromFile(int& N, int& R, const std::string& filename) {
+    std::ifstream inFile(filename);
+    if (!inFile) {
+        std::cerr << "Cannot open file for reading: " << filename << std::endl;
+        exit(1);
+    }
+    inFile >> N >> R;
+    inFile.close();
+}
+
 bool compareResults(const std::vector<float>& cpuResults, const std::vector<float>& gpuResults, float tolerance = 1e-5) {
     if (cpuResults.size() != gpuResults.size()) {
         return false;
@@ -54,28 +65,22 @@ bool compareResults(const std::vector<float>& cpuResults, const std::vector<floa
 }
 
 int main() {
-    int N = 32;
-    int R = 1;
+    int N, R;
+    loadParamsFromFile(N, R, "params.txt");
+
     int inputSize = N * N;
     int outputSize = (N - 2 * R) * (N - 2 * R);
     int totalOps = outputSize * (2 * R + 1) * (2 * R + 1);
 
-    std::vector<float> input(inputSize); // Inicjalizacja losowymi danymi
+    std::vector<float> input(inputSize);
     std::vector<float> output(outputSize, 0.0f);
     std::vector<float> cpuOutput(outputSize, 0.0f);
 
     // Wczytanie danych wejściowych z pliku
     loadDataFromFile(input, "input_data.bin");
-    loadDataFromFile(cpuOutput, "cpu_output.bin");
 
-    // Wyświetlenie tablicy wejściowej
-    std::cout << "Input Array:" << std::endl;
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < N; ++j) {
-            std::cout << input[i * N + j] << " ";
-        }
-        std::cout << std::endl;
-    }
+    // Wczytanie wyników CPU z pliku
+    loadDataFromFile(cpuOutput, "cpu_output.bin");
 
     float* d_input, * d_output;
     checkCudaError(cudaMalloc((void**)&d_input, inputSize * sizeof(float)), "Failed to allocate device input memory");
@@ -83,50 +88,71 @@ int main() {
 
     checkCudaError(cudaMemcpy(d_input, input.data(), inputSize * sizeof(float), cudaMemcpyHostToDevice), "Failed to copy input data to device");
 
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((N - 2 * R + threadsPerBlock.x - 1) / threadsPerBlock.x,
-        (N - 2 * R + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    size_t sharedMemSize = (threadsPerBlock.x + 2 * R) * (threadsPerBlock.y + 2 * R) * sizeof(float);
+    std::vector<int> blockSizes = { 8, 16, 32 }; // Rozmiary bloków wątków
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // Zbiorcze wyniki
+    std::vector<std::tuple<int, int, int, double, double, double>> results;
 
-    calculateOnGPU << <numBlocks, threadsPerBlock, sharedMemSize >> > (d_input, d_output, N, R);
+    for (int BS : blockSizes) {
+        dim3 threadsPerBlock(BS, BS);
+        dim3 numBlocks((N - 2 * R + threadsPerBlock.x - 1) / threadsPerBlock.x,
+            (N - 2 * R + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-    auto end = std::chrono::high_resolution_clock::now();
+        auto start = std::chrono::high_resolution_clock::now();
 
-    checkCudaError(cudaGetLastError(), "Kernel launch failed");
-    checkCudaError(cudaDeviceSynchronize(), "Kernel synchronization failed");
+        calculateOnGPU << <numBlocks, threadsPerBlock >> > (d_input, d_output, N, R);
 
-    checkCudaError(cudaMemcpy(output.data(), d_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy output data to host");
+        checkCudaError(cudaGetLastError(), "Kernel launch failed");
+        checkCudaError(cudaDeviceSynchronize(), "Kernel synchronization failed");
 
-    std::chrono::duration<double> duration = end - start;
-    double seconds = duration.count();
-    double flops = totalOps / seconds;
-    double cgma = static_cast<double>(totalOps) / (inputSize * sizeof(float) + outputSize * sizeof(float));
+        auto end = std::chrono::high_resolution_clock::now();
 
-    // Wyświetlenie wyników
-    std::cout << "Output Array (GPU):" << std::endl;
-    for (int i = 0; i < outputSize; ++i) {
-        if (i % (N - 2 * R) == 0) std::cout << std::endl;
-        std::cout << output[i] << " ";
-    }
-    std::cout << std::endl;
+        checkCudaError(cudaMemcpy(output.data(), d_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy output data to host");
 
-    std::cout << "Czas obliczen: " << seconds << " seconds" << std::endl;
-    std::cout << "Wydajność obliczen : " << flops << " FLOP/s" << std::endl;
-    std::cout << "Arithmetic Intensity (CGMA): " << cgma << " FLOP/byte" << std::endl;
-    std::cout << "Rozmiar pamięci współdzielonej przez blok watkow: " << sharedMemSize << " bytes" << std::endl;
+        std::chrono::duration<double> duration = end - start;
+        double seconds = duration.count();
+        double flops = totalOps / seconds;
+        double cgma = static_cast<double>(totalOps) / (inputSize * sizeof(float) + outputSize * sizeof(float));
 
-    // Porównanie wyników
-    if (compareResults(cpuOutput, output)) {
-        std::cout << "Wyniki obliczen są poprawne!" << std::endl;
-    }
-    else {
-        std::cout << "Wyniki obliczen są niepoprawne!" << std::endl;
+        // Zapis wyników do zbiorczych wyników
+        results.push_back(std::make_tuple(N, R, BS, seconds, flops, cgma));
+
+        // Wyświetlenie wyników
+        /*
+        std::cout << "Output Array (GPU, BS = " << BS << "):" << std::endl;
+        for (int i = 0; i < outputSize; ++i) {
+            if (i % (N - 2 * R) == 0) std::cout << std::endl;
+            std::cout << output[i] << " ";
+        }
+        */
+        std::cout << std::endl;
+
+        std::cout << "Czas obliczeń: " << seconds << " seconds" << std::endl;
+        std::cout << "Wydajność obliczeń: " << flops << " FLOP/s" << std::endl;
+        std::cout << "Arithmetic Intensity (CGMA): " << cgma << " FLOP/byte" << std::endl;
+        std::cout << "Rozmiar pamięci współdzielonej przez blok wątków: " << 0 << " bytes (not used)" << std::endl;
+
+        // Porównanie wyników
+        /*
+        if (compareResults(cpuOutput, output)) {
+            std::cout << "Wyniki obliczeń są poprawne!" << std::endl;
+        }
+        else {
+            std::cout << "Wyniki obliczeń są niepoprawne!" << std::endl;
+        }
+        */
     }
 
     cudaFree(d_input);
     cudaFree(d_output);
+
+    // Wyświetlenie zbiorczych wyników
+    std::cout << "\nZbiorcze wyniki:" << std::endl;
+    std::cout << "N\tR\tBS\tCzas(s)\tFLOP/s\tCGMA" << std::endl;
+    for (const auto& result : results) {
+        std::cout << std::get<0>(result) << "\t" << std::get<1>(result) << "\t" << std::get<2>(result) << "\t"
+            << std::get<3>(result) << "\t" << std::get<4>(result) << "\t" << std::get<5>(result) << std::endl;
+    }
 
     return 0;
 }
